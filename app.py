@@ -42,6 +42,39 @@ PALETTE = [
     "#ea580c", "#0891b2", "#ca8a04", "#64748b",
 ]
 
+# Default custom-transfer weights for the GOP primary (from the supplied
+# matrix_default_rank_weights workbook). Outer key = eliminated ("from")
+# candidate; inner = recipient ("to") -> share of ballots transferred. Each
+# row's remainder (1 - sum) is treated as exhausted. Looked up by candidate
+# name, so it auto-applies to the GOP sheet; other contests fall back to an
+# even split.
+DEFAULT_TRANSFER_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "CharlesGOP":       {"BushGOP": 0.10, "MidgleyGOP": 0.10, "Other Candidates": 0.20},
+    "BushGOP":          {"CharlesGOP": 0.10, "MidgleyGOP": 0.50, "Other Candidates": 0.15},
+    "MidgleyGOP":       {"CharlesGOP": 0.33, "BushGOP": 0.33, "Other Candidates": 0.20},
+    "Other Candidates": {"CharlesGOP": 0.20, "BushGOP": 0.25, "MidgleyGOP": 0.40},
+}
+
+
+def default_matrix(cands: List[str]) -> pd.DataFrame:
+    """Seed the transfer-matrix editor (rows = From, cols = To).
+
+    Uses the supplied weights when every candidate is known (the GOP set);
+    otherwise falls back to an even split among the other candidates.
+    """
+    known = all(c in DEFAULT_TRANSFER_WEIGHTS for c in cands)
+    m = pd.DataFrame(0.0, index=cands, columns=cands)
+    for frm in cands:
+        if known:
+            for to, share in DEFAULT_TRANSFER_WEIGHTS[frm].items():
+                if to in m.columns:
+                    m.loc[frm, to] = share
+        else:
+            even = round(1.0 / max(len(cands) - 1, 1), 2)
+            for to in cands:
+                m.loc[frm, to] = 0.0 if to == frm else even
+    return m
+
 
 # ==========================================================================
 # Page config + light/dark theming
@@ -212,6 +245,15 @@ def scenario_controls(pdata: PrimaryData, key: str):
         model_label
     ]
 
+    if pdata.other_col:
+        st.caption(f"⛔ **{pdata.other_col}** is eliminated first in every "
+                   "scenario — it aggregates several candidates who can't win — "
+                   "and its ballots transfer per the model below.")
+
+    if model == "matrix":
+        st.caption("ℹ️ With the **Custom matrix** model, exhaustion is taken from "
+                   "the matrix itself (each row's remainder), so the sliders below "
+                   "are ignored.")
     st.markdown("**Ballot exhaustion** (share of an eliminated candidate's ballots "
                 "that rank no one else and drop out):")
     cols = st.columns(len(cands))
@@ -219,7 +261,8 @@ def scenario_controls(pdata: PrimaryData, key: str):
     for i, c in enumerate(cands):
         default = 0.30 if c == pdata.other_col else 0.10
         exhaustion[c] = cols[i].slider(
-            f"{c}", 0.0, 1.0, default, 0.05, key=f"ex_{key}_{c}"
+            f"{c}", 0.0, 1.0, default, 0.05, key=f"ex_{key}_{c}",
+            disabled=(model == "matrix"),
         )
 
     # ---- What-if first-round adjustments -------------------------------
@@ -241,19 +284,18 @@ def scenario_controls(pdata: PrimaryData, key: str):
     # ---- Custom transfer matrix editor ---------------------------------
     transfer_matrix = None
     if model == "matrix":
-        st.markdown("**Custom transfer matrix** — for each *from* candidate (row), "
-                    "what share of ballots flow to each *to* candidate. Rows that "
-                    "sum to <1 leave the remainder as exhausted.")
-        base = pd.DataFrame(
-            0.0, index=cands, columns=cands
-        )
-        # Seed a reasonable default: evenly to others.
-        for r in cands:
-            for cc in cands:
-                base.loc[r, cc] = 0.0 if cc == r else round(1.0 / (len(cands) - 1), 2)
+        st.markdown("**Custom transfer matrix** — each **row** is an eliminated "
+                    "(*From*) candidate; each **column** is a recipient (*To*). "
+                    "Values are the share of that candidate's ballots transferred. "
+                    "Rows summing to <1 leave the remainder exhausted. Defaults to "
+                    "the supplied rank-weights table.")
         transfer_matrix = st.data_editor(
-            base, key=f"tm_{key}", use_container_width=True
+            default_matrix(cands), key=f"tm_{key}", use_container_width=True
         )
+        rowsums = transfer_matrix.sum(axis=1)
+        if (rowsums > 1.0 + 1e-9).any():
+            over = ", ".join(rowsums[rowsums > 1.0 + 1e-9].index)
+            st.caption(f"⚠️ Rows over 100% will be scaled down: {over}.")
 
     # ---- Apply scenario to the town matrix -----------------------------
     M = pdata.df[cands].fillna(0).astype(float).copy()
@@ -438,12 +480,14 @@ def render_primary(label: str, pdata: PrimaryData, geojson: dict = None):
     M, settings = scenario_controls(pdata, key=label)
 
     # ---- Run the simulation -------------------------------------------
+    force_first = [pdata.other_col] if pdata.other_col else []
     result = run_irv(
         town_matrix=M,
         candidates=cands,
         transfer_model=settings["model"],
         exhaustion=settings["exhaustion"],
         transfer_matrix=settings["transfer_matrix"],
+        force_first=force_first,
     )
 
     totals = pd.Series({c: float(M[c].sum()) for c in cands})
@@ -578,11 +622,13 @@ def render_primary(label: str, pdata: PrimaryData, geojson: dict = None):
 
 def sensitivity_table(M: pd.DataFrame, pdata: PrimaryData) -> pd.DataFrame:
     cands = pdata.candidates
+    force_first = [pdata.other_col] if pdata.other_col else []
     rows = []
     for model in ("town_proxy", "proportional"):
         for ex in (0.0, 0.2, 0.4):
             exhaustion = {c: (ex if c == pdata.other_col else 0.10) for c in cands}
-            res = run_irv(M, cands, transfer_model=model, exhaustion=exhaustion)
+            res = run_irv(M, cands, transfer_model=model, exhaustion=exhaustion,
+                          force_first=force_first)
             final = res.rounds[-1] if res.rounds else None
             share = (final.totals.get(res.winner, 0) / final.continuing_ballots * 100
                      if final and final.continuing_ballots else 0)
@@ -611,8 +657,8 @@ def main():
             "- We only have **first-choice** counts, so 2nd/3rd preferences are "
             "**modeled** via the selected transfer assumption. Treat outputs as "
             "*scenario projections*, not official results.\n"
-            "- 'Other Candidates' is treated as a single bucket of minor "
-            "candidates; it is eliminated early and given a higher default "
+            "- 'Other Candidates' is a single bucket of minor candidates who "
+            "cannot win, so it is **eliminated first** and given a higher default "
             "exhaustion rate.\n"
             "- A candidate wins on holding a **majority of continuing (non-"
             "exhausted) ballots**, per Maine's rules."

@@ -91,5 +91,10 @@ dissolve features by `TOWN`, keep only the `TOWN` property, simplify geometry
 We only have **first-choice** vote counts, so 2nd/3rd preferences are
 **modeled**, not observed. Outputs are *scenario projections* for analysis and
 should be verified against official Secretary of State tabulations before
-publication. "Other Candidates" is treated as one bucket, eliminated early with
-a higher default exhaustion rate.
+publication. "Other Candidates" is a bucket of minor candidates who cannot win,
+so it is **eliminated first** in every scenario (with a higher default
+exhaustion rate) and its ballots transfer per the selected model.
+
+The **Custom matrix** model defaults to the supplied rank-weights table for the
+GOP set (rows = *From* / eliminated candidate, columns = *To* / recipient;
+each row's remainder is exhausted) and to an even split for other contests.

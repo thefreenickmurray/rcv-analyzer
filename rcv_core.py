@@ -103,6 +103,7 @@ def run_irv(
     exhaustion: Optional[Dict[str, float]] = None,
     default_exhaustion: float = 0.10,
     transfer_matrix: Optional[pd.DataFrame] = None,
+    force_first: Optional[List[str]] = None,
 ) -> RCVResult:
     """Run an instant-runoff tabulation.
 
@@ -117,15 +118,22 @@ def run_irv(
         How eliminated ballots are redistributed.
     exhaustion : dict, optional
         Per-candidate exhaustion rate (0-1). Missing candidates use
-        ``default_exhaustion``.
+        ``default_exhaustion``. Ignored for the "matrix" model, where
+        exhaustion is encoded by rows summing to < 1.
     default_exhaustion : float
         Fallback exhaustion rate.
     transfer_matrix : DataFrame, optional
         Required for the "matrix" model. Rows = from-candidate,
         columns = to-candidate, values = share (each row should sum to
         <= 1; the remainder is treated as exhausted).
+    force_first : list[str], optional
+        Candidates that must be eliminated before normal IRV proceeds
+        (e.g. an aggregated "Other Candidates" block that cannot win).
+        They are never declared the winner and are removed first, weakest
+        first, transferring their ballots per the selected model.
     """
     exhaustion = exhaustion or {}
+    force_first = list(force_first or [])
     cand = [c for c in candidates if c in town_matrix.columns]
 
     # Town-level working matrix of *active* ballots (float for transfers).
@@ -157,19 +165,30 @@ def run_irv(
             continuing_ballots=continuing,
         )
 
-        leader = max(totals, key=totals.get) if totals else None
+        active_force = [c for c in force_first if c in active]
+        eligible = [c for c in active if c not in force_first]
 
-        # Win condition: strict majority of continuing ballots, OR only one
-        # candidate left standing.
-        if leader is not None and (totals[leader] > threshold or len(active) == 1):
-            rr.winner = leader
-            winner = leader
+        # Win condition: a *real* (non-forced) candidate holds a strict
+        # majority of continuing ballots, OR only one candidate remains.
+        # Forced-block candidates (e.g. "Other") can never win.
+        win_cand = None
+        if len(active) == 1:
+            win_cand = active[0]
+        elif eligible:
+            top = max(eligible, key=lambda c: totals[c])
+            if totals[top] > threshold:
+                win_cand = top
+        if win_cand is not None:
+            rr.winner = win_cand
+            winner = win_cand
             rounds.append(rr)
             break
 
-        # Otherwise eliminate the weakest candidate (ties broken by smallest
-        # original first-round count, then alphabetical for determinism).
-        loser = min(active, key=lambda c: (totals[c], original[c].sum(), c))
+        # Eliminate: forced-block candidates first (weakest first), otherwise
+        # the weakest eligible candidate. Ties broken by original first-round
+        # count, then name, for determinism.
+        pool = active_force if active_force else eligible
+        loser = min(pool, key=lambda c: (totals[c], original[c].sum(), c))
         rr.eliminated = loser
 
         ex_rate = float(exhaustion.get(loser, default_exhaustion))
@@ -272,15 +291,20 @@ def _redistribute(
         return transfers, exhausted
 
     if model == "matrix" and transfer_matrix is not None and loser in transfer_matrix.index:
-        keep = 1.0 - ex_rate
+        # Use the matrix shares literally: each row's values are the fraction
+        # of the eliminated candidate's ballots flowing to each recipient, and
+        # whatever the row leaves unallocated (1 - row sum) is exhausted. The
+        # per-candidate exhaustion slider is intentionally NOT applied here.
         row = transfer_matrix.loc[loser]
-        shares = {c: float(row.get(c, 0.0)) for c in remaining}
+        shares = {c: max(float(row.get(c, 0.0)), 0.0) for c in remaining}
         s = sum(shares.values())
         if s <= 0:
             return transfers, loser_votes_total  # nothing specified -> exhaust
+        if s > 1.0:  # over-specified row: scale down to a valid distribution
+            shares = {c: v / s for c, v in shares.items()}
         moved_total = 0.0
         for c in remaining:
-            frac = shares[c] / s * keep
+            frac = shares[c]
             add = loser_votes_total * frac
             # Distribute proportionally across towns to keep town matrix sane.
             M[c] += M[loser] * frac
