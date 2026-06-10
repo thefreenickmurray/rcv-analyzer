@@ -52,24 +52,31 @@ placeholders, percent strings, and all-zero towns. Any column that isn't
 *Town*, *Total Votes*, or *Est. Votes Counted* is treated as a candidate; a
 column named *Other Candidates* is handled as the minor-candidate bucket.
 
-## Geographic heatmap setup
+## Geographic heatmap
 
-The choropleth needs Maine town/township boundary polygons (not bundled, to
-keep the repo small). One-time setup:
-
-1. Open the Maine GeoLibrary dataset:
-   [Maine Town and Townships Boundary Polygons](https://maine.hub.arcgis.com/datasets/maine::maine-town-and-townships-boundary-polygons-feature-1/explore).
-2. Click **Download → GeoJSON**.
-3. Point the app at it using the sidebar's **Map boundaries** section, via any of:
-   - **Bundled / local file** — save the file as `sample_data/maine_towns.geojson`.
-   - **Upload GeoJSON** — upload it in the app each session.
-   - **Fetch from URL** — paste the GeoJSON download link, or an ArcGIS
-     `FeatureServer/0` layer URL (auto-converted to a GeoJSON query and cached).
+**Works out of the box** — Maine town boundaries are bundled at
+`sample_data/maine_towns.geojson` (924 towns/townships, ~0.6 MB). It's a
+dissolved + simplified derivative of the Maine GeoLibrary
+[Maine Town and Townships Boundary Polygons](https://maine.hub.arcgis.com/datasets/maine::maine-town-and-townships-boundary-polygons-feature-1/explore)
+dataset (geometry simplified to ~55 m and trimmed to just the `TOWN` field).
+The sidebar's **Map boundaries** source defaults to this file.
 
 The app auto-detects the town-name field and joins on a normalized key (so
-"Cary Plt" matches "Cary Plantation"); unmatched towns (e.g. unorganized
-territories) simply render blank. No Mapbox token is required — it uses the
-free Carto basemap.
+"Cary Plt" matches "Cary Plantation"). ~476/519 reporting units match polygons
+— the rest are sparsely-populated **Unorganized Territories** (the `* UT`
+aggregates), which total under ~1% of votes and render blank. No Mapbox token
+is required (free Carto basemap).
+
+To use a different/updated boundary set, pick **Upload GeoJSON** or **Fetch
+from URL** in the sidebar (a direct `.geojson` link, or an ArcGIS
+`FeatureServer/0` layer URL which is auto-converted to a GeoJSON query).
+
+### Regenerating the bundled file
+
+If you need to rebuild it from a fresh ArcGIS download, the steps are:
+dissolve features by `TOWN`, keep only the `TOWN` property, simplify geometry
+(`shapely`'s `simplify(0.0005, preserve_topology=True)`), round coordinates to
+4 decimals, and write minified GeoJSON.
 
 ## Files
 
