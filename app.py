@@ -551,13 +551,13 @@ def render_primary(label: str, pdata: PrimaryData, geojson: dict = None):
             st.metric(f"Towns led by {top}",
                       f"{lead_counts.iloc[0]} / {len(voted)}",
                       f"{lead_counts.iloc[0] / len(voted) * 100:.0f}% of voting towns")
-        bar = px.bar(lead_counts.reset_index().rename(
-            columns={"index": "Candidate", "Leader": "Towns", "count": "Towns"}),
-            x="Towns", y=lead_counts.index, orientation="h",
-            color=lead_counts.index, color_discrete_map=cmap)
+        lc_df = lead_counts.rename_axis("Candidate").reset_index(name="Towns")
+        bar = px.bar(lc_df, x="Towns", y="Candidate", orientation="h",
+                     color="Candidate", color_discrete_map=cmap)
         bar.update_layout(showlegend=False, height=260,
                           margin=dict(l=10, r=10, t=40, b=10),
-                          title="Towns led (first choice)")
+                          title="Towns led (first choice)",
+                          yaxis=dict(categoryorder="total ascending"))
         st.plotly_chart(bar, use_container_width=True)
     with lc2:
         st.dataframe(
