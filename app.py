@@ -28,10 +28,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import geo
 from data_io import PrimaryData, load_primaries
 from rcv_core import RCVResult, run_irv, town_leaders
 
-SAMPLE_PATH = os.path.join(os.path.dirname(__file__), "sample_data", "MEGOVprimarydata.ods")
+HERE = os.path.dirname(__file__)
+SAMPLE_PATH = os.path.join(HERE, "sample_data", "MEGOVprimarydata.ods")
+LOCAL_GEOJSON = os.path.join(HERE, "sample_data", "maine_towns.geojson")
 
 # A stable, readable palette (Charles/Shah first => leaders get the strong blue).
 PALETTE = [
@@ -91,6 +94,88 @@ def get_data() -> Dict[str, PrimaryData]:
     except Exception as exc:  # noqa: BLE001
         st.sidebar.error(f"Sample data unavailable: {exc}")
         st.stop()
+
+
+# ==========================================================================
+# Town boundary GeoJSON for the choropleth map (cached, source-flexible)
+# ==========================================================================
+@st.cache_data(show_spinner="Fetching town boundaries…")
+def _geojson_from_url(url: str) -> dict:
+    return geo.fetch_geojson(url)
+
+
+@st.cache_data(show_spinner=False)
+def _geojson_from_text(text: str) -> dict:
+    return geo.load_geojson_text(text)
+
+
+@st.cache_data(show_spinner=False)
+def _geojson_from_local(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return geo.load_geojson_text(f.read())
+
+
+# We don't hardcode an ArcGIS endpoint (item/org IDs change and a wrong guess
+# would silently 404). Paste the dataset's "Download → GeoJSON" link, or a
+# FeatureServer/MapServer layer URL (auto-converted to a GeoJSON query).
+DEFAULT_BOUNDARY_URL = ""
+
+
+def _resolve_boundary_url(url: str) -> str:
+    """Accept either a direct GeoJSON URL or an ArcGIS layer URL."""
+    u = url.strip()
+    if ("FeatureServer" in u or "MapServer" in u) and "f=geojson" not in u and "/query" not in u:
+        return geo.arcgis_geojson_query(u)
+    return u
+
+
+def get_boundaries():
+    """Sidebar control to load town-boundary GeoJSON; returns dict or None."""
+    st.sidebar.header("3 · Map boundaries (optional)")
+    src = st.sidebar.radio(
+        "Town polygons source",
+        ["Bundled / local file", "Upload GeoJSON", "Fetch from URL", "Off"],
+        help="Maine town boundaries for the choropleth. Get them from the "
+        "ArcGIS dataset (Download → GeoJSON) and either save as "
+        "sample_data/maine_towns.geojson, upload here, or paste the URL.",
+    )
+    try:
+        if src == "Off":
+            return None
+        if src == "Bundled / local file":
+            if os.path.exists(LOCAL_GEOJSON):
+                return _geojson_from_local(LOCAL_GEOJSON)
+            st.sidebar.info(
+                "No `sample_data/maine_towns.geojson` found. Download it from "
+                "the ArcGIS dataset (Download → GeoJSON) and save it there, or "
+                "use Upload / URL."
+            )
+            return None
+        if src == "Upload GeoJSON":
+            up = st.sidebar.file_uploader("GeoJSON file", type=["geojson", "json"])
+            if up is not None:
+                return _geojson_from_text(up.getvalue().decode("utf-8"))
+            return None
+        # Fetch from URL
+        raw_url = st.sidebar.text_input(
+            "GeoJSON / ArcGIS layer URL", value=DEFAULT_BOUNDARY_URL,
+            placeholder="Paste the dataset's Download → GeoJSON link",
+            help="A direct .geojson URL, or an ArcGIS FeatureServer/MapServer "
+            "layer URL (e.g. .../FeatureServer/0) which is auto-converted.",
+        )
+        url = _resolve_boundary_url(raw_url)
+        if not url:
+            st.sidebar.caption("Paste a URL, then click **Load boundaries**.")
+            return None
+        if st.sidebar.button("Load boundaries", use_container_width=True) or \
+                st.session_state.get("_geo_loaded_url") == url:
+            st.session_state["_geo_loaded_url"] = url
+            return _geojson_from_url(url)
+        st.sidebar.caption("Click **Load boundaries** to fetch.")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        st.sidebar.error(f"Could not load boundaries: {exc}")
+        return None
 
 
 # ==========================================================================
@@ -289,10 +374,64 @@ def _rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def _choropleth(**kwargs):
+    """Call px.choropleth_map (Plotly>=5.24) or fall back to the older
+    px.choropleth_mapbox, normalizing the map-style/center keyword names."""
+    if hasattr(px, "choropleth_map"):
+        return px.choropleth_map(**kwargs)
+    # Legacy API uses the 'mapbox' suffix and different layout kwargs.
+    kwargs["mapbox_style"] = kwargs.pop("map_style")
+    return px.choropleth_mapbox(**kwargs)
+
+
+def town_choropleth(
+    leaders: pd.DataFrame, M: pd.DataFrame, pdata: PrimaryData,
+    geojson: dict, cmap: Dict[str, str], mode: str, candidate: str,
+):
+    """Build a Maine town choropleth.
+
+    mode == "leader": categorical fill by first-choice town leader.
+    mode == "share":  continuous fill by ``candidate``'s vote share.
+    Returns (figure, match_stats) or (None, stats) if towns can't be joined.
+    """
+    prepared, field, stats = geo.prepare_geojson(geojson, list(leaders[pdata.town_col]))
+    if prepared is None:
+        return None, stats
+
+    df = leaders.copy()
+    df["join_key"] = df[pdata.town_col].map(geo.normalize_town)
+    common = dict(
+        geojson=prepared, locations="join_key", featureidkey="properties.join_key",
+        center={"lat": 45.35, "lon": -69.2}, zoom=5.6, opacity=0.72,
+        map_style="carto-positron", hover_name=pdata.town_col,
+    )
+
+    if mode == "share":
+        cand_share = (M[candidate] / M[pdata.candidates].sum(axis=1).replace(0, np.nan) * 100)
+        df["Share"] = cand_share.round(1).fillna(0).values
+        fig = _choropleth(
+            data_frame=df, color="Share",
+            color_continuous_scale="Blues", range_color=(0, max(60, df["Share"].max())),
+            hover_data={"join_key": False, "Total": True, "Leader": True, "Share": ":.1f"},
+            **common,
+        )
+        title = f"{candidate} — first-choice vote share by town (%)"
+    else:
+        fig = _choropleth(
+            data_frame=df, color="Leader", color_discrete_map=cmap,
+            hover_data={"join_key": False, "Total": True, "Margin %": ":.1f"},
+            **common,
+        )
+        title = "First-choice leader by town"
+
+    fig.update_layout(height=560, margin=dict(l=0, r=0, t=40, b=0), title=title)
+    return fig, stats
+
+
 # ==========================================================================
 # Per-primary rendering
 # ==========================================================================
-def render_primary(label: str, pdata: PrimaryData):
+def render_primary(label: str, pdata: PrimaryData, geojson: dict = None):
     cands = pdata.candidates
     cmap = color_map(cands)
 
@@ -382,6 +521,32 @@ def render_primary(label: str, pdata: PrimaryData):
             use_container_width=True, height=320, hide_index=True,
         )
 
+    # ---- Geographic heatmap (choropleth) ------------------------------
+    st.markdown("#### Geographic heatmap")
+    if geojson is None:
+        st.info("Enable **Map boundaries** in the sidebar (load a Maine town "
+                "GeoJSON) to see the town-level choropleth.")
+    else:
+        mc1, mc2 = st.columns([2, 3])
+        view = mc1.radio("Color towns by", ["First-choice leader", "Candidate vote share"],
+                         key=f"mapmode_{label}")
+        cand_sel = mc2.selectbox("Candidate (for vote-share view)", cands,
+                                 key=f"mapcand_{label}")
+        mode = "leader" if view == "First-choice leader" else "share"
+        try:
+            fig, stats = town_choropleth(leaders, M, pdata, geojson, cmap, mode, cand_sel)
+            if fig is None:
+                st.warning("Couldn't match town names in the GeoJSON to the data "
+                           f"(matched {stats['matched']}/{stats['total']}). Check that "
+                           "the boundary file covers Maine towns.")
+            else:
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(f"Matched {stats['matched']} of {stats['total']} towns to "
+                           "polygons. Unmatched towns (e.g. unorganized territories) "
+                           "appear blank.")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Map rendering failed: {exc}")
+
     # ---- Sensitivity analysis -----------------------------------------
     with st.expander("📈 Sensitivity analysis — does the winner hold up?"):
         st.caption("Re-runs the contest across transfer models and a sweep of "
@@ -465,10 +630,12 @@ def main():
         f"{len(v.df):,} towns" for k, v in data.items()
     ))
 
+    geojson = get_boundaries()
+
     tabs = st.tabs([f"🏛️ {k}" for k in data.keys()])
     for tab, (label, pdata) in zip(tabs, data.items()):
         with tab:
-            render_primary(label, pdata)
+            render_primary(label, pdata, geojson)
 
     st.divider()
     st.caption("RCV Analyzer · transfers are modeled assumptions for sensitivity "
