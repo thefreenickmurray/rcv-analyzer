@@ -1,0 +1,8 @@
+# Maine 2026 Governor Primary — RCV Analyzer
+# Pinned to compatible minimum versions; newer patch releases are fine.
+streamlit>=1.33
+pandas>=2.0
+numpy>=1.24
+plotly>=5.18
+odfpy>=1.4          # reads .ods workbooks
+openpyxl>=3.1       # reads .xlsx workbooks
